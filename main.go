@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"flag"
+	"io/fs"
 	"log"
+	"path/filepath"
+	"sync"
 
 	"fmt"
 	"go/ast"
@@ -13,15 +15,18 @@ import (
 	"go/token"
 	"io"
 	"os"
-	"time"
 	"strings"
+
 	"text/template"
+	"time"
 )
 
 type StringerAction func(string, string) error
+var channel	chan bool
+var wg sync.WaitGroup
 
 func main() {
-	fmt.Println("time start: ", time.Now())
+	timeStart := time.Now()
 	// logger := log.New(os.Stdout, "[LOG]", log.LstdFlags)
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
@@ -31,6 +36,7 @@ func main() {
 	isRecursion := flag.Bool("r", false, "enable recursion")
 	isSavedToStdout := flag.Bool("n", false, "display stringer code gen to stdout in place of disk")
 	isHelp := flag.Bool("h", false, "display this help")
+	coreCount := flag.Int("c", 4, "select paralell core processing")
 
 	flag.Parse()
 
@@ -39,22 +45,32 @@ func main() {
 		os.Exit(0)
 	}
 
+	channel = make(chan bool, *coreCount)
+	wg = sync.WaitGroup{}
+
 	var action StringerAction = saveToDisk
 	if *isSavedToStdout { action = displayToStdout }
 
+	// Main processing function
 	stringer(*rootPath, *isRecursion, action)
 
-	fmt.Println("time end: ", time.Now())
+	// Wait for all the remaining goroutine to complete before moving forward
+	close(channel)
+	wg.Wait()
+
+	if len(channel) > 0 {
+		log.Println("fatal error, not all goroutines completed execution")
+	}
+	
+	timeEnd := time.Now()
+	elapsedTime := timeEnd.Sub(timeStart)
+	fmt.Println("elapsed time: ", elapsedTime)
 
 	return
 }
 
 func stringer(dirname string, isRecursive bool, action StringerAction) error {
-	err := os.Chdir(dirname)
-	if err != nil { return err }
-	defer os.Chdir("..")
-
-	dirs, err := os.ReadDir(".")
+	dirs, err := os.ReadDir(dirname)
 	if err != nil {
 		log.Println("error while reading directory, ", err.Error())
 		return err
@@ -63,43 +79,56 @@ func stringer(dirname string, isRecursive bool, action StringerAction) error {
 	for _, dir := range dirs {
 
 		if isRecursive && dir.IsDir() {
-			subDir := dir.Name()
+			subDir := filepath.Join(dirname, dir.Name())
 			err = stringer(subDir, isRecursive, action)
 
 		} else if dir.Type().IsRegular() && strings.HasSuffix(dir.Name(), ".go"){
+			wg.Add(1)
 
-			filename := dir.Name()
-			file, err := os.Open(filename)
+			go func(dir fs.DirEntry) {
+				defer wg.Done()
+				defer func() { <- channel }()
 
-			if err != nil {
-				log.Println("error while opening file, ", err.Error())
-				continue
-			}
+				filename := filepath.Join(dirname, dir.Name())
+				file, err := os.Open(filename)
 
-			defer file.Close()
-			fileContent, err := io.ReadAll(file)
-			if err != nil {
-				log.Println("error while reading file, ", err.Error())
-				continue
-			}
+				if err != nil {
+					log.Println("error while opening file, ", filename, err.Error())
+					return
+				}
 
-			newContent, err := buildStringerForStructure(fileContent)
-			if err != nil {
-				log.Println("error while generating stringer, ", err.Error())
-				continue
-			}
+				defer file.Close()
+				fileContent, err := io.ReadAll(file)
+				if err != nil {
+					log.Println("error while reading file, ", err.Error())
+					return
+				}
 
-			formatedContent, err := format.Source([]byte(newContent))
-			if err != nil {
-				log.Println("error while formating the generated stringer, ", err.Error())
-				continue
-			}
+				newContent, err := buildStringerForStructure(fileContent)
+				if err != nil {
+					log.Println("error while generating stringer, ", err.Error())
+					return
+				}
 
-			err = action(filename, string(formatedContent))
-			if err != nil {
-				log.Println("error while applying change, ", err.Error())
-				continue
-			}
+				if len(newContent) == 0 {
+					return
+				}
+
+				formatedContent, err := format.Source([]byte(newContent))
+				if err != nil {
+					log.Println("error while formating the generated stringer, ", err.Error())
+					return
+				}
+
+				err = action(filename, string(formatedContent))
+				if err != nil {
+					log.Println("error while applying change, ", err.Error())
+					return
+				}
+
+			}(dir)
+
+			channel <- true
 		}
 	}
 
@@ -168,7 +197,7 @@ func buildStringerForStructure (content []byte) (string, error) {
 	}
 
 	if len(finalContent) == 0 {
-		return finalContent, errors.New("no struct found in this file")
+		return finalContent, nil
 	}
 
 	packageName := f.Name.Name
